@@ -896,3 +896,139 @@ with tab4:
         if not msg: msg = ["변경 사항이 없습니다."]
         st.success(" / ".join(msg))
         st.rerun()
+# =========================
+# TAB5: 🗃️ 휴지통(복원)
+# =========================
+with tab5:
+    st.info("휴지통에 보관된 삭제 이력을 복원할 수 있습니다. 선택 후 '선택 항목 복원'을 누르세요.")
+
+    if not trash_enabled():
+        st.warning("휴지통 테이블이 설정되어 있지 않습니다. Secrets에 TRASH_TABLE_ID 또는 TRASH_TABLE_NAME을 설정하세요.")
+        st.stop()
+
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
+        st.error("Airtable secrets가 필요합니다."); st.stop()
+
+    tx_ref   = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
+    trash_t  = trash_ref()
+
+    # 휴지통 레코드 로드
+    trash_recs = get_trash_all()
+    if not trash_recs:
+        st.caption("휴지통이 비어있습니다.")
+        st.stop()
+
+    # 표시용 테이블 구성
+    disp = []
+    for tr in trash_recs:
+        tid = tr.get("id")
+        f   = tr.get("fields", {})
+        orig_id   = f.get("original_record_id", "")
+        deleted_at= f.get("deleted_at", "")
+        raw       = f.get("raw", "")
+
+        cas = name = qty = unit = io = bld = room = lab = ""
+        tx_time = ""
+        # raw JSON 파싱
+        try:
+            js = json.loads(raw) if isinstance(raw, str) else raw
+            fields = js.get("fields", {})
+            cas   = (fields.get("CAS") or "")
+            name  = fields.get("Name") or fields.get("name") or ""
+            qty   = fields.get("qty")
+            unit  = fields.get("unit","")
+            io    = fields.get("io_type","")
+            bld   = fields.get("building","")
+            room  = fields.get("room","")
+            lab   = fields.get("lab","")
+            tx_time = fields.get("tx_time","") or js.get("createdTime","")
+        except Exception:
+            pass
+
+        disp.append({
+            "trash_id": tid,
+            "삭제시각": deleted_at.replace("T"," ").replace("Z",""),
+            "원본 record_id": orig_id,
+            "일시": tx_time.replace("T"," ").replace("Z",""),
+            "구분": io,
+            "CAS": cas,
+            "물질명(파일명)": name,
+            "수량": f"{int(round(float(qty)))}" if qty not in (None,"") else "",
+            "단위": unit,
+            "건물": bld, "호수": room, "실험실": lab,
+            "복원": False
+        })
+
+    df_trash = pd.DataFrame(disp)
+    df_trash.index = range(1, len(df_trash) + 1)
+    df_trash.index.name = "No."
+
+    edited_trash = st.data_editor(
+        df_trash,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "trash_id": st.column_config.TextColumn("trash_id", disabled=True),
+            "삭제시각": st.column_config.TextColumn("삭제시각", disabled=True),
+            "원본 record_id": st.column_config.TextColumn("원본 record_id", disabled=True),
+            "일시": st.column_config.TextColumn("일시", disabled=True),
+            "구분": st.column_config.TextColumn("구분", disabled=True),
+            "CAS": st.column_config.TextColumn("CAS", disabled=True),
+            "물질명(파일명)": st.column_config.TextColumn("물질명(파일명)", disabled=True),
+            "수량": st.column_config.TextColumn("수량", disabled=True),
+            "단위": st.column_config.TextColumn("단위", disabled=True),
+            "건물": st.column_config.TextColumn("건물", disabled=True),
+            "호수": st.column_config.TextColumn("호수", disabled=True),
+            "실험실": st.column_config.TextColumn("실험실", disabled=True),
+            "복원": st.column_config.CheckboxColumn("복원"),
+        },
+        hide_index=False,
+        key="trash_editor_grid",
+    )
+
+    colx, coly = st.columns([1,3])
+    restore_btn = colx.button("✅ 선택 항목 복원")
+
+    if restore_btn:
+        restored = removed = errors = 0
+        # 원본 테이블 키
+        for _, row in edited_trash.iterrows():
+            if not bool(row.get("복원", False)):
+                continue
+            tid = row.get("trash_id")
+            # 휴지통 레코드 상세를 다시 불러서 raw 이용
+            try:
+                rec = at_get_record(AIRTABLE_BASE_ID, trash_t, tid)
+                if not rec:
+                    errors += 1
+                    continue
+                f = rec.get("fields", {})
+                raw = f.get("raw", "")
+                js  = json.loads(raw) if isinstance(raw, str) else raw
+                fields = (js or {}).get("fields", {})
+                if not isinstance(fields, dict) or not fields:
+                    errors += 1
+                    continue
+
+                # 안전하게 복원: 소프트삭제 흔적 제거
+                fields.pop("deleted", None)
+                # Airtable에 다시 생성
+                r = at_create_record(AIRTABLE_BASE_ID, tx_ref, fields)
+                if r.status_code in (200, 201):
+                    restored += 1
+                    # 휴지통에서 삭제
+                    d = at_delete_record(AIRTABLE_BASE_ID, trash_t, tid)
+                    if d.status_code in (200, 202):
+                        removed += 1
+                else:
+                    errors += 1
+            except Exception:
+                errors += 1
+
+        msg = []
+        if restored: msg.append(f"♻️ 복원 {restored}건")
+        if removed:  msg.append(f"🧹 휴지통 정리 {removed}건")
+        if errors:   msg.append(f"⚠️ 오류 {errors}건")
+        if not msg:  msg = ["변경 사항이 없습니다."]
+        st.success(" / ".join(msg))
+        st.rerun()
