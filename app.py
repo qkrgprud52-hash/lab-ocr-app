@@ -1,7 +1,7 @@
 import streamlit as st
-import requests, base64, re
+import requests, base64, re, pandas as pd
 from urllib.parse import quote
-import pandas as pd
+from datetime import datetime, timedelta, date
 
 # =========================
 # 기본 UI 설정
@@ -74,9 +74,7 @@ def at_find_one(base_id, table_id_or_name, formula: str):
     return js.get("records", [None])[0]
 
 def ensure_material_record(cas_no: str, name_guess: str = ""):
-    """
-    Materials에 CAS가 없으면 자동 생성 (name만 대충 채워두고, 지정수량/단위/유별/밀도는 비워둠)
-    """
+    """Materials에 CAS 없으면 자동 생성"""
     if not cas_no:
         return
     mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
@@ -123,7 +121,7 @@ def save_to_airtable(fields: dict):
     return ok, (r.text if not ok else "OK")
 
 # =========================
-# 제4류 지정수량(고정값)
+# 제4류 지정수량(고정값) — TAB3에서 사용
 # =========================
 LEGAL_LIMITS_L = {
     "특수인화물": 100.0,
@@ -227,7 +225,12 @@ def fmt_pct(ratio) -> str:
 # =========================
 # 탭
 # =========================
-tab1, tab2, tab3 = st.tabs(["📷 기록 (OCR/저장)", "📊 재고/지정수량", "🏷️ 위험물(제4류) 현황"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📷 기록 (OCR/저장)",
+    "📦 재고 현황",
+    "🏷️ 위험물(제4류) 현황",
+    "🔄 입출고 로그"
+])
 
 # =========================
 # TAB1: 기록 (OCR/저장)
@@ -323,81 +326,132 @@ with tab1:
         st.caption("이미지와 Vision API Key를 입력하면 OCR을 시작합니다.")
 
 # =========================
-# TAB2: 재고/지정수량 (CAS별) — 정수/퍼센트 표기
+# TAB2: 📦 재고 현황 — CAS별 / 실험실별
 # =========================
 with tab2:
-    st.info("이 탭은 `Lab OCR Results`의 수량(qty)을 합산하고, `Materials`의 지정수량과 비교해 비율을 계산합니다. (정수/%)")
+    subt1, subt2 = st.tabs(["🔬 CAS별", "🏫 실험실별"])
 
+    # 공통 데이터 로딩
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
-        st.error("Airtable secrets가 필요합니다."); st.stop()
-
-    tx_ref  = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
-    try:
-        with st.spinner("🔄 데이터 불러오는 중…"):
-            tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
-            mats_idx = load_materials_index()
-    except Exception as e:
-        st.error(f"불러오기 실패: {e}")
-        st.stop()
-
-    # 트랜잭션 합계(CAS+단위별)
-    sums = {}
-    for r in tx:
-        f = r.get("fields",{})
-        cas = (f.get("CAS") or "").strip()
-        q   = f.get("qty")
-        u   = f.get("unit")
-        if not cas or q is None:
-            continue
-        key = (cas, u or "")
-        sums[key] = sums.get(key, 0.0) + float(q)
-
-    # 표 구성 (정수/퍼센트 표기)
-    disp_rows = []
-    csv_rows  = []
-    for (cas, unit), qty_sum in sums.items():
-        m = mats_idx.get(cas, {})
-        dqty  = m.get("designated_qty")
-        dunit = m.get("unit")
-        ratio = None
-        note  = ""
-        if dqty and dunit and unit and dunit==unit:
-            ratio = (qty_sum / float(dqty)) if float(dqty)>0 else None
-        else:
-            note = "마스터 지정수량/단위 불일치 또는 누락"
-
-        # 표시는 정수/퍼센트
-        disp_rows.append({
-            "CAS": cas,
-            "물질명": m.get("name",""),
-            "재고합계": fmt_int(qty_sum),
-            "단위": unit,
-            "지정수량": fmt_int(dqty) if dqty is not None else "",
-            "지정단위": dunit or "",
-            "비율": fmt_pct(ratio),
-            "메모": note
-        })
-        # CSV도 같은 형식으로 저장
-        csv_rows.append(disp_rows[-1].copy())
-
-    # 정렬: 비율 높은 순 (문자열이므로 정렬키 별도로)
-    def ratio_val(pct_str):
-        if not pct_str: return -1
-        try:
-            return int(pct_str.replace("%",""))
-        except:
-            return -1
-    disp_rows.sort(key=lambda r: -ratio_val(r["비율"]))
-
-    st.markdown("#### 📈 CAS별 재고 / 지정수량 비율")
-    if not disp_rows:
-        st.caption("표시할 데이터가 없습니다. 기록 탭에서 먼저 저장해 주세요.")
+        st.error("Airtable secrets가 필요합니다.")
     else:
-        df = pd.DataFrame(disp_rows)
-        st.dataframe(df, use_container_width=True)
-        st.download_button("📥 CSV로 내려받기",
-                           pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8-sig"),
-                           file_name="inventory_vs_designated.csv", mime="text/csv")
+        tx_ref  = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
+        try:
+            with st.spinner("🔄 데이터 불러오는 중…"):
+                tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
+                mats_idx = load_materials_index()
+        except Exception as e:
+            st.error(f"불러오기 실패: {e}")
+            tx, mats_idx = [], {}
+
+    # ---------- CAS별 ----------
+    with subt1:
+        st.caption("CAS별 재고합계만 표시 (지정수량/비율 제거).")
+        # (CAS, unit)별 합계
+        sums = {}
+        for r in tx:
+            f = r.get("fields",{})
+            cas = (f.get("CAS") or "").strip()
+            q   = f.get("qty")
+            u   = f.get("unit")
+            if not cas or q is None:
+                continue
+            key = (cas, u or "")
+            sums[key] = sums.get(key, 0.0) + float(q)
+
+        rows = []
+        for (cas, unit), qty_sum in sums.items():
+            m = mats_idx.get(cas, {})
+            rows.append({
+                "CAS": cas,
+                "물질명": m.get("name",""),
+                "재고합계": fmt_int(qty_sum),
+                "단위": unit,
+                "메모": ""
+            })
+
+        # 수량 많은 순 정렬
+        rows.sort(key=lambda r: int(r["재고합계"]) if r["재고합계"] else 0, reverse=True)
+
+        if rows:
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True)
+            st.download_button("📥 CSV로 내려받기 (CAS별)",
+                               df.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="inventory_by_cas.csv", mime="text/csv")
+        else:
+            st.caption("표시할 데이터가 없습니다.")
+
+    # ---------- 실험실별 ----------
+    with subt2:
+        st.caption("실험실별 재고를 **L 단위로 환산**(가능한 항목)하여 요약과 상세를 제공합니다.")
+        # 요약: (building, room, lab)별 총 L
+        sum_lab = {}      # key: (bld, room, lab) -> liters
+        detail = []       # 상세: per CAS per lab with L/원단위
+        skipped = []
+
+        for r in tx:
+            f = r.get("fields",{})
+            cas = (f.get("CAS") or "").strip()
+            q   = f.get("qty")
+            unit= f.get("unit")
+            bld = f.get("building","")
+            room= f.get("room","")
+            lab = f.get("lab","")
+            if not cas or q is None or not unit:
+                continue
+
+            dens = get_density(cas, mats_idx)
+            Lval = to_liters(q, unit, dens)
+            if Lval is None:
+                skipped.append({"CAS": cas, "qty": q, "unit": unit, "building": bld, "room": room, "lab": lab})
+                continue
+
+            key = (bld, room, lab)
+            sum_lab[key] = sum_lab.get(key, 0.0) + float(Lval)
+
+            # 상세표 (CAS 단위)
+            m = mats_idx.get(cas, {})
+            detail.append({
+                "건물": bld, "호수": room, "실험실": lab,
+                "CAS": cas, "물질명": m.get("name",""),
+                "환산보유량(L)": fmt_int(Lval),
+                "원수량": fmt_int(q), "원단위": unit
+            })
+
+        # 요약표
+        rows_sum = [
+            {"건물": k[0], "호수": k[1], "실험실": k[2], "총보유량(L)": fmt_int(v)}
+            for k,v in sum_lab.items()
+        ]
+        rows_sum.sort(key=lambda r: int(r["총보유량(L)"]) if r["총보유량(L)"] else 0, reverse=True)
+
+        st.markdown("#### 🧾 실험실별 요약 (L)")
+        if rows_sum:
+            df_sum = pd.DataFrame(rows_sum)
+            st.dataframe(df_sum, use_container_width=True)
+            st.download_button("📥 CSV로 내려받기 (실험실 요약)",
+                               df_sum.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="inventory_by_lab_summary.csv", mime="text/csv")
+        else:
+            st.caption("요약할 데이터가 없습니다.")
+
+        st.markdown("#### 🔎 실험실별 상세 (CAS)")
+        if detail:
+            df_det = pd.DataFrame(detail)
+            # 정렬: 건물/호수/실험실/환산량 내림차순
+            df_det["__sort__"] = df_det["환산보유량(L)"].apply(lambda x: int(x) if str(x).isdigit() else 0)
+            df_det = df_det.sort_values(by=["건물","호수","실험실","__sort__"], ascending=[True, True, True, False]).drop(columns="__sort__")
+            st.dataframe(df_det, use_container_width=True)
+            st.download_button("📥 CSV로 내려받기 (실험실 상세)",
+                               df_det.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="inventory_by_lab_detail.csv", mime="text/csv")
+        else:
+            st.caption("상세 데이터가 없습니다.")
+
+        if skipped:
+            with st.expander("⚠️ 환산 불가 항목 보기 (밀도/단위 문제)"):
+                st.dataframe(pd.DataFrame(skipped), use_container_width=True)
 
 # =========================
 # TAB3: 위험물(제4류) 현황 — 창고 전체 모니터링 (정수/퍼센트 + 잔여허용량)
@@ -426,15 +480,15 @@ with tab3:
     for r in tx:
         f = r.get("fields",{})
         cas = (f.get("CAS") or "").strip()
-        qty = f.get("qty")
-        unit = f.get("unit")
-        if not cas or qty is None or not unit:
+        q   = f.get("qty")
+        unit= f.get("unit")
+        if not cas or q is None or not unit:
             continue
 
         dens = get_density(cas, mats_idx)  # 우선 Materials, 없으면 내장
-        Lval = to_liters(qty, unit, dens)
+        Lval = to_liters(q, unit, dens)
         if Lval is None:
-            skipped.append({"CAS": cas, "qty": qty, "unit": unit, "reason": "밀도없음/환산불가"})
+            skipped.append({"CAS": cas, "qty": q, "unit": unit})
             continue
 
         hclass = classify_hazard(cas, mats_idx)  # 우선 Materials, 없으면 내장
@@ -457,15 +511,15 @@ with tab3:
                   "경고" if ratio is not None and ratio>=0.5 else
                   "주의" if ratio is not None and ratio>=0.2 else "정상")
 
-        disp_rows2.append({
+        row = {
             "구분": key,
             "현재보유량(L)": fmt_int(cur),
             "지정수량(L)": fmt_int(limit),
             "잔여허용량(L)": fmt_int(remain),
             "비율": fmt_pct(ratio),
             "상태": status
-        })
-        csv_rows2.append(disp_rows2[-1].copy())
+        }
+        disp_rows2.append(row); csv_rows2.append(row.copy())
 
     st.markdown("#### 📦 제4류 위험물 저장량 현황")
     if not disp_rows2:
@@ -489,3 +543,78 @@ with tab3:
         if skipped:
             st.markdown("##### ⚠️ 환산 불가 목록")
             st.dataframe(pd.DataFrame(skipped))
+
+# =========================
+# TAB4: 🔄 입출고 로그 — 기간 필터
+# =========================
+with tab4:
+    st.info("기간을 선택해서 입·출고·폐기 내역을 확인합니다. (Airtable의 createdTime 기준)")
+
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
+        st.error("Airtable secrets가 필요합니다."); st.stop()
+
+    tx_ref  = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
+
+    # 기본 기간: 최근 30일
+    today = date.today()
+    default_start = today - timedelta(days=30)
+    colf1, colf2 = st.columns(2)
+    start_d = colf1.date_input("시작일", value=default_start)
+    end_d   = colf2.date_input("종료일", value=today)
+
+    try:
+        with st.spinner("🔄 데이터 불러오는 중…"):
+            tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
+            mats_idx = load_materials_index()
+    except Exception as e:
+        st.error(f"불러오기 실패: {e}")
+        tx, mats_idx = [], {}
+
+    # 기간 필터 (createdTime 사용)
+    def in_range(created_iso: str) -> bool:
+        try:
+            dt = datetime.fromisoformat(created_iso.replace("Z","+00:00")).date()
+            return (start_d <= dt <= end_d)
+        except:
+            return True
+
+    logs = []
+    for r in tx:
+        ct = r.get("createdTime")
+        if ct and not in_range(ct):
+            continue
+        f = r.get("fields",{})
+        cas = (f.get("CAS") or "").strip()
+        m = mats_idx.get(cas, {})
+        logs.append({
+            "일시": ct.replace("T"," ").replace("Z","") if ct else "",
+            "구분": f.get("io_type",""),
+            "CAS": cas,
+            "물질명": m.get("name",""),
+            "수량": fmt_int(f.get("qty")),
+            "단위": f.get("unit",""),
+            "건물": f.get("building",""),
+            "호수": f.get("room",""),
+            "실험실": f.get("lab",""),
+        })
+
+    # 최근 순 정렬
+    def parse_dt(s):
+        try:
+            return datetime.fromisoformat(s)
+        except:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            except:
+                return datetime.min
+    logs.sort(key=lambda x: parse_dt(x["일시"]), reverse=True)
+
+    st.markdown("#### 📒 입출고 내역")
+    if logs:
+        df_logs = pd.DataFrame(logs)
+        st.dataframe(df_logs, use_container_width=True)
+        st.download_button("📥 CSV로 내려받기 (입출고 로그)",
+                           df_logs.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="transactions_log.csv", mime="text/csv")
+    else:
+        st.caption("표시할 데이터가 없습니다.")
