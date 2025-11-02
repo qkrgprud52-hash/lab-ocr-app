@@ -115,6 +115,11 @@ def at_delete_record(base_id, table_id_or_name, record_id: str):
     r = requests.delete(url, headers=at_headers(), timeout=20)
     return r
 
+def at_create_record(base_id, table_id_or_name, fields: dict):
+    url = f"https://api.airtable.com/v0/{base_id}/{table_id_or_name}"
+    r = requests.post(url, json={"fields": fields}, headers=at_headers(), timeout=20)
+    return r
+
 def ensure_material_record(cas_no: str, name_guess: str = ""):
     """Materials에 CAS 없으면 자동 생성"""
     if not cas_no:
@@ -238,6 +243,16 @@ def save_to_trash(orig_record: dict) -> bool:
     except:
         return False
 
+def get_trash_all():
+    """휴지통 테이블 전체 로드"""
+    if not trash_enabled():
+        return []
+    try:
+        return at_get_all(AIRTABLE_BASE_ID, trash_ref())
+    except Exception as e:
+        st.warning(f"휴지통 로드 실패: {e}")
+        return []
+
 # 제4류 지정수량(고정값)
 LEGAL_LIMITS_L = {
     "특수인화물": 100.0,
@@ -246,9 +261,8 @@ LEGAL_LIMITS_L = {
     "알코올류": 4100.0,
 }
 
-# 내장 간이 밀도 (g/mL) & 유별 매핑 (없으면 Materials 값을 사용)
+# 내장 간이 밀도 (g/mL) & 유별 매핑
 BUILTIN_CHEM = {
-    # CAS        name_hint,         hazard_class,         density_g_per_ml
     "64-17-5":   ("Ethanol",        "알코올류",           0.789),
     "67-63-0":   ("Isopropanol",    "알코올류",           0.786),
     "67-56-1":   ("Methanol",       "알코올류",           0.792),
@@ -851,8 +865,8 @@ with tab4:
             # 삭제 우선 처리
             if bool(row.get("삭제", False)):
                 try:
-                    # 휴지통 사용 가능하면 원본 백업 후 물리 삭제
-                    if trash_enabled():
+                    if TRASH_TABLE_ID or TRASH_TABLE_NAME:
+                        # 휴지통 사용: 원본 백업 후 물리 삭제
                         orig = at_get_record(AIRTABLE_BASE_ID, tx_ref, rid)
                         ok_backup = save_to_trash(orig)
                         if not ok_backup:
@@ -874,7 +888,7 @@ with tab4:
                     errors += 1
                 continue
 
-            # 일시 수정 처리: 변경 여부 판단
+            # 일시 수정 처리
             new_dt = row.get("새_일시")
             orig_iso = orig_time_map.get(rid, "")
             new_iso = to_utc_iso(new_dt) if isinstance(new_dt, datetime) else ""
@@ -888,38 +902,35 @@ with tab4:
                 except Exception:
                     errors += 1
 
-        # 결과 메시지
         msg = []
         if updated: msg.append(f"🕒 일시 수정 {updated}건")
         if deleted: msg.append(f"🗑️ 삭제(휴지통으로 이동) {deleted}건")
         if soft_deleted: msg.append(f"🗂️ 소프트삭제 {soft_deleted}건")
         if errors:  msg.append(f"⚠️ 오류 {errors}건")
-        if not msg: msg = ["변경 사항이 없습니다."]
+        if not msg:  msg = ["변경 사항이 없습니다."]
         st.success(" / ".join(msg))
         st.rerun()
+
 # =========================
 # TAB5: 🗃️ 휴지통(복원)
 # =========================
 with tab5:
     st.info("휴지통에 보관된 삭제 이력을 복원할 수 있습니다. 선택 후 '선택 항목 복원'을 누르세요.")
 
-    if not trash_enabled():
+    if not (TRASH_TABLE_ID or TRASH_TABLE_NAME):
         st.warning("휴지통 테이블이 설정되어 있지 않습니다. Secrets에 TRASH_TABLE_ID 또는 TRASH_TABLE_NAME을 설정하세요.")
         st.stop()
-
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
         st.error("Airtable secrets가 필요합니다."); st.stop()
 
     tx_ref   = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
-    trash_t  = trash_ref()
+    trash_t  = table_ref(TRASH_TABLE_ID, TRASH_TABLE_NAME)
 
-    # 휴지통 레코드 로드
     trash_recs = get_trash_all()
     if not trash_recs:
         st.caption("휴지통이 비어있습니다.")
         st.stop()
 
-    # 표시용 테이블 구성
     disp = []
     for tr in trash_recs:
         tid = tr.get("id")
@@ -930,7 +941,6 @@ with tab5:
 
         cas = name = qty = unit = io = bld = room = lab = ""
         tx_time = ""
-        # raw JSON 파싱
         try:
             js = json.loads(raw) if isinstance(raw, str) else raw
             fields = js.get("fields", {})
@@ -992,12 +1002,10 @@ with tab5:
 
     if restore_btn:
         restored = removed = errors = 0
-        # 원본 테이블 키
         for _, row in edited_trash.iterrows():
             if not bool(row.get("복원", False)):
                 continue
             tid = row.get("trash_id")
-            # 휴지통 레코드 상세를 다시 불러서 raw 이용
             try:
                 rec = at_get_record(AIRTABLE_BASE_ID, trash_t, tid)
                 if not rec:
@@ -1011,13 +1019,10 @@ with tab5:
                     errors += 1
                     continue
 
-                # 안전하게 복원: 소프트삭제 흔적 제거
-                fields.pop("deleted", None)
-                # Airtable에 다시 생성
+                fields.pop("deleted", None)  # 소프트삭제 흔적 제거
                 r = at_create_record(AIRTABLE_BASE_ID, tx_ref, fields)
                 if r.status_code in (200, 201):
                     restored += 1
-                    # 휴지통에서 삭제
                     d = at_delete_record(AIRTABLE_BASE_ID, trash_t, tid)
                     if d.status_code in (200, 202):
                         removed += 1
