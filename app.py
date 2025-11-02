@@ -1,9 +1,12 @@
 import streamlit as st
 import requests, base64, re, json, math
 from urllib.parse import quote
+import pandas as pd
 
-# ---------- 기본 설정 ----------
-st.set_page_config(page_title="연구실 시약 OCR/재고", page_icon="🧪", layout="wide")
+# =========================
+# 기본 UI 설정
+# =========================
+st.set_page_config(page_title="연구실 시약 OCR / 재고 관리", page_icon="🧪", layout="wide")
 st.markdown("""
 <style>
 .stButton>button {background:#16a34a;color:white;border:none;border-radius:10px;padding:0.6rem 1rem;font-weight:600;}
@@ -13,12 +16,16 @@ st.markdown("""
 """, unsafe_allow_html=True)
 st.title("🧪 연구실 시약 OCR / 재고 관리")
 
-# ---------- Secrets ----------
+# =========================
+# Secrets (Streamlit → Secrets)
+# =========================
 AIRTABLE_TOKEN        = st.secrets.get("AIRTABLE_TOKEN", "")
 AIRTABLE_BASE_ID      = st.secrets.get("AIRTABLE_BASE_ID", "")
+
 # 기록 테이블(트랜잭션)
-AIRTABLE_TABLE_ID     = st.secrets.get("AIRTABLE_TABLE_ID", "")     # tbl... (권장)
+AIRTABLE_TABLE_ID     = st.secrets.get("AIRTABLE_TABLE_ID", "")                 # tbl... 형태 권장
 AIRTABLE_TABLE_NAME   = st.secrets.get("AIRTABLE_TABLE_NAME", "Lab OCR Results")
+
 # 마스터 테이블(Materials)
 MATERIALS_TABLE_ID    = st.secrets.get("MATERIALS_TABLE_ID", "")
 MATERIALS_TABLE_NAME  = st.secrets.get("MATERIALS_TABLE_NAME", "Materials")
@@ -26,7 +33,9 @@ MATERIALS_TABLE_NAME  = st.secrets.get("MATERIALS_TABLE_NAME", "Materials")
 IMGBB_KEY             = st.secrets.get("IMGBB_KEY", "")
 DEFAULT_GCP_KEY       = st.secrets.get("GCP_KEY", "")
 
-# ---------- 유틸 ----------
+# =========================
+# 유틸
+# =========================
 CAS_RE = re.compile(r"\b\d{2,7}-\d{2}-\d\b")
 def extract_cas(text: str) -> str:
     m = CAS_RE.search(text or "")
@@ -39,7 +48,7 @@ def at_headers():
     return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
 
 def at_get_all(base_id, table_id_or_name):
-    """Airtable 전 레코드 조회 (100건 페이징)"""
+    """Airtable 전 레코드 조회 (페이지네이션 처리)"""
     out = []
     url = f"https://api.airtable.com/v0/{base_id}/{table_id_or_name}"
     params = {"pageSize": 100}
@@ -54,14 +63,42 @@ def at_get_all(base_id, table_id_or_name):
         params["offset"] = off
     return out
 
+def at_find_one(base_id, table_id_or_name, formula: str):
+    """filterByFormula로 단건 조회"""
+    url = f"https://api.airtable.com/v0/{base_id}/{table_id_or_name}"
+    r = requests.get(url, headers=at_headers(),
+                     params={"maxRecords": 1, "filterByFormula": formula},
+                     timeout=20)
+    r.raise_for_status()
+    js = r.json()
+    return js.get("records", [None])[0]
+
+def ensure_material_record(cas_no: str, name_guess: str = ""):
+    """
+    Materials에 CAS가 없으면 자동 생성 (name만 대충 채워두고, 지정수량/단위는 비워둠)
+    """
+    if not cas_no:
+        return
+    mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
+    try:
+        rec = at_find_one(AIRTABLE_BASE_ID, mref, formula=f"{{CAS}} = '{cas_no}'")
+        if rec:
+            return
+        payload = {"fields": {"CAS": cas_no}}
+        if name_guess:
+            payload["fields"]["name"] = name_guess[:100]
+        url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{mref}"
+        requests.post(url, json=payload, headers=at_headers(), timeout=20)
+    except:
+        # 조용히 패스 (자동 보조 기능이라 필수는 아님)
+        pass
+
 def run_ocr(image_bytes: bytes, gcp_key: str) -> dict:
     url = f"https://vision.googleapis.com/v1/images:annotate?key={gcp_key}"
-    payload = {
-        "requests": [{
-            "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
-            "features": [{"type": "TEXT_DETECTION"}]
-        }]
-    }
+    payload = {"requests": [{
+        "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
+        "features": [{"type": "TEXT_DETECTION"}]
+    }]}
     return requests.post(url, json=payload, timeout=40).json()
 
 def upload_to_imgbb(image_bytes, filename: str) -> str | None:
@@ -69,26 +106,26 @@ def upload_to_imgbb(image_bytes, filename: str) -> str | None:
         return None
     try:
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        r = requests.post(
-            "https://api.imgbb.com/1/upload",
-            data={"key": IMGBB_KEY, "image": b64, "name": filename},
-            timeout=25
-        )
+        r = requests.post("https://api.imgbb.com/1/upload",
+                          data={"key": IMGBB_KEY, "image": b64, "name": filename},
+                          timeout=25)
         r.raise_for_status()
         return r.json()["data"]["url"]
-    except Exception:
+    except:
         return None
 
 def save_to_airtable(fields: dict):
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
         return False, "Airtable secrets 미설정"
     tref = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
-    url  = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{tref}"
-    r    = requests.post(url, json={"fields": fields}, headers=at_headers(), timeout=30)
-    ok   = r.status_code in (200, 201)
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{tref}"
+    r = requests.post(url, json={"fields": fields}, headers=at_headers(), timeout=30)
+    ok = r.status_code in (200, 201)
     return ok, (r.text if not ok else "OK")
 
-# ---------- 탭 ----------
+# =========================
+# 탭
+# =========================
 tab1, tab2 = st.tabs(["📷 기록 (OCR/저장)", "📊 재고/지정수량"])
 
 # =========================
@@ -122,18 +159,15 @@ with tab1:
     st.markdown("### 📦 수량")
     colQ1, colQ2 = st.columns([1,1])
     qty = colQ1.number_input("수량", min_value=0.0, step=1.0, format="%.3f")
-    unit = colQ2.selectbox(
-        "단위",
-        ["g","mL","L","kg","EA","cyl"],
-        index=["g","mL","L","kg","EA","cyl"].index(st.session_state.last["unit"])
-    )
+    unit = colQ2.selectbox("단위", ["g","mL","L","kg","EA","cyl"],
+                           index=["g","mL","L","kg","EA","cyl"].index(st.session_state.last["unit"]))
 
     st.divider()
 
     if uploaded_file and gcp_key:
         with st.spinner("🔎 OCR 분석 중…"):
             img_bytes = uploaded_file.getvalue()
-            ocr_json  = run_ocr(img_bytes, gcp_key)
+            ocr_json = run_ocr(img_bytes, gcp_key)
 
         text = ""
         try:
@@ -152,9 +186,9 @@ with tab1:
             st.info("ℹ OCR/메타/수량을 채우면 저장할 수 있어요.")
 
         if st.button("💾 Airtable에 저장", disabled=not ready):
-            sign    = +1 if io_type=="입고" else -1  # 출고/반품/폐기 => 음수 처리
+            sign = +1 if io_type=="입고" else -1  # 출고/반품/폐기 → 음수
             img_url = upload_to_imgbb(img_bytes, uploaded_file.name)
-            fields  = {
+            fields = {
                 "Name": uploaded_file.name,
                 "ocr_text": text,
                 "CAS": cas_no,
@@ -168,8 +202,12 @@ with tab1:
             }
             if img_url:
                 fields["Attachments"] = [{"url": img_url, "filename": uploaded_file.name}]
+
             ok, msg = save_to_airtable(fields)
             if ok:
+                # ✅ Materials 자동 생성 (없을 때만)
+                ensure_material_record(cas_no, name_guess=text.splitlines()[0] if text else "")
+
                 st.success("✅ 저장 완료!")
                 st.session_state.last = {"dept":dept,"lab":lab,"bld":bld,"room":room,"io":io_type,"unit":unit}
             else:
@@ -187,55 +225,54 @@ with tab2:
     st.info("이 탭은 `Lab OCR Results`의 수량(qty)을 합산하고, `Materials`의 지정수량과 비교해 비율을 계산합니다.")
 
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
-        st.error("Airtable secrets가 필요합니다.")
-        st.stop()
+        st.error("Airtable secrets가 필요합니다."); st.stop()
 
     tx_ref  = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
     mat_ref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
 
     try:
         with st.spinner("🔄 데이터 불러오는 중…"):
-            tx   = at_get_all(AIRTABLE_BASE_ID, tx_ref)
+            tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
             mats = at_get_all(AIRTABLE_BASE_ID, mat_ref)
     except Exception as e:
         st.error(f"불러오기 실패: {e}")
         st.stop()
 
-    # 트랜잭션 합계(CAS별, 단위별)
+    # 트랜잭션 합계(CAS+단위별)
     sums = {}
     for r in tx:
-        f   = r.get("fields",{})
+        f = r.get("fields",{})
         cas = (f.get("CAS") or "").strip()
         q   = f.get("qty")
-        u   = f.get("unit")  # 기록 테이블은 소문자 unit 사용
+        u   = f.get("unit")
         if not cas or q is None:
             continue
         key = (cas, u or "")
         sums[key] = sums.get(key, 0.0) + float(q)
 
-    # 마스터(지정수량) — ★여기가 패치: Unit/ unit 모두 대응
+    # 마스터(지정수량)
     master = {}
     for r in mats:
-        f   = r.get("fields",{})
+        f = r.get("fields",{})
         cas = (f.get("CAS") or "").strip()
         if not cas:
             continue
         master[cas] = {
             "name": f.get("name",""),
             "designated_qty": f.get("designated_qty"),
-            "unit": (f.get("Unit") or f.get("unit") or "")   # <-- 패치 포인트
+            "unit": f.get("unit","")
         }
 
-    # 테이블 구성
+    # 표 구성
     rows = []
     for (cas, unit), qty_sum in sums.items():
-        m     = master.get(cas, {})
+        m = master.get(cas, {})
         dqty  = m.get("designated_qty")
         dunit = m.get("unit")
         ratio = None
         note  = ""
-        if dqty and dunit and unit and dunit == unit:
-            ratio = (qty_sum / float(dqty)) if float(dqty) > 0 else None
+        if dqty and dunit and unit and dunit==unit:
+            ratio = (qty_sum / float(dqty)) if float(dqty)>0 else None
         else:
             note = "마스터 지정수량/단위 불일치 또는 누락"
 
@@ -250,18 +287,16 @@ with tab2:
             "메모": note
         })
 
-    # 정렬: 비율 높은 순(경고 우선)
+    # 경고 높은 순 정렬
     def ratio_key(r):
         return -(r["비율"] if r["비율"] is not None else -1)
     rows.sort(key=ratio_key)
 
-    # 표시
     st.markdown("#### 📈 CAS별 재고 / 지정수량 비율")
     if not rows:
         st.caption("표시할 데이터가 없습니다. 기록 탭에서 먼저 저장해 주세요.")
     else:
-        import pandas as pd
-
+        # 행 색상 하이라이트
         def color_row(r):
             ratio = r["비율"]
             if ratio is None: return ""
@@ -271,9 +306,15 @@ with tab2:
             return ""
 
         df = pd.DataFrame(rows)
-        st.dataframe(
-            df.style.apply(lambda s: [color_row(r) for r in df.to_dict("records")], axis=0),
-            use_container_width=True
+        st.dataframe(df.style.apply(lambda s: [color_row(r) for r in df.to_dict("records")], axis=0),
+                     use_container_width=True)
+
+        # ✅ CSV 다운로드
+        st.download_button(
+            "📥 CSV로 내려받기",
+            df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="inventory_vs_designated.csv",
+            mime="text/csv"
         )
 
         over = [r for r in rows if (r["비율"] is not None and r["비율"]>=1.0)]
