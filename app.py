@@ -1,7 +1,7 @@
 import streamlit as st
 import requests, base64, re, pandas as pd
 from urllib.parse import quote
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 # =========================
 # 기본 UI 설정
@@ -36,6 +36,12 @@ DEFAULT_GCP_KEY       = st.secrets.get("GCP_KEY", "")
 # =========================
 # 유틸
 # =========================
+def show_df(df: pd.DataFrame):
+    df2 = df.copy()
+    df2.index = range(1, len(df2) + 1)  # 1부터 시작
+    df2.index.name = "No."
+    st.dataframe(df2, use_container_width=True)
+
 CAS_RE = re.compile(r"\b\d{2,7}-\d{2}-\d\b")
 def extract_cas(text: str) -> str:
     m = CAS_RE.search(text or "")
@@ -73,20 +79,80 @@ def at_find_one(base_id, table_id_or_name, formula: str):
     js = r.json()
     return js.get("records", [None])[0]
 
+def at_update_record(base_id, table_id_or_name, record_id: str, fields: dict):
+    url = f"https://api.airtable.com/v0/{base_id}/{table_id_or_name}/{record_id}"
+    r = requests.patch(url, json={"fields": fields}, headers=at_headers(), timeout=20)
+    return r
+
+def at_delete_record(base_id, table_id_or_name, record_id: str):
+    url = f"https://api.airtable.com/v0/{base_id}/{table_id_or_name}/{record_id}"
+    r = requests.delete(url, headers=at_headers(), timeout=20)
+    return r
+
 def ensure_material_record(cas_no: str, name_guess: str = ""):
     """Materials에 CAS 없으면 자동 생성"""
     if not cas_no:
-        return
+        return None
     mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
     try:
         rec = at_find_one(AIRTABLE_BASE_ID, mref, formula=f"{{CAS}} = '{cas_no}'")
         if rec:
-            return
+            return rec  # 이미 있음
         payload = {"fields": {"CAS": cas_no}}
         if name_guess:
             payload["fields"]["name"] = name_guess[:100]
         url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{mref}"
-        requests.post(url, json=payload, headers=at_headers(), timeout=20)
+        r = requests.post(url, json=payload, headers=at_headers(), timeout=20)
+        if r.status_code in (200, 201):
+            return r.json()
+    except:
+        pass
+    return None
+
+def set_material_name_if_missing(cas_no: str, mats_idx: dict, name_hint: str = ""):
+    """Materials에 name이 없으면 PubChem 조회해 채움(가능하면)"""
+    if not cas_no:
+        return
+    mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
+    current = mats_idx.get(cas_no, {})
+    if current.get("name"):
+        return
+    # PubChem 조회 시도
+    name_found = None
+    try:
+        # Title 또는 IUPACName 중 하나라도 얻어오기
+        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{cas_no}/property/Title,IUPACName/JSON"
+        r = requests.get(url, timeout=12)
+        if r.status_code == 200:
+            js = r.json()
+            props = js.get("PropertyTable", {}).get("Properties", [])
+            if props:
+                p = props[0]
+                name_found = p.get("Title") or p.get("IUPACName")
+    except:
+        pass
+    # fallback으로 OCR 첫줄 힌트 사용
+    if not name_found:
+        name_found = (name_hint or "").strip()
+        if "\n" in name_found:
+            name_found = name_found.split("\n", 1)[0]
+        name_found = name_found[:100]
+
+    if not name_found:
+        return
+
+    # Materials upsert/update
+    try:
+        rec = at_find_one(AIRTABLE_BASE_ID, mref, formula=f"{{CAS}} = '{cas_no}'")
+        if rec:
+            rid = rec["id"]
+            at_update_record(AIRTABLE_BASE_ID, mref, rid, {"name": name_found})
+        else:
+            requests.post(
+                f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{mref}",
+                json={"fields": {"CAS": cas_no, "name": name_found}},
+                headers=at_headers(), timeout=20
+            )
     except:
         pass
 
@@ -120,9 +186,7 @@ def save_to_airtable(fields: dict):
     ok = r.status_code in (200, 201)
     return ok, (r.text if not ok else "OK")
 
-# =========================
-# 제4류 지정수량(고정값) — TAB3에서 사용
-# =========================
+# 제4류 지정수량(고정값)
 LEGAL_LIMITS_L = {
     "특수인화물": 100.0,
     "제1석유류(비수용성)": 600.0,
@@ -146,7 +210,11 @@ BUILTIN_CHEM = {
 def load_materials_index():
     """Materials를 CAS 키로 묶어 name, designated_qty, unit, hazard_class, density 제공"""
     mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
-    mats = at_get_all(AIRTABLE_BASE_ID, mref)
+    try:
+        mats = at_get_all(AIRTABLE_BASE_ID, mref)
+    except Exception as e:
+        st.warning(f"Materials 로드 실패: {e}")
+        mats = []
     out = {}
     for r in mats:
         f = r.get("fields",{})
@@ -163,7 +231,6 @@ def load_materials_index():
     return out
 
 def classify_hazard(cas: str, mats_idx: dict) -> str | None:
-    """Materials.hazard_class 우선, 없으면 내장 매핑 사용"""
     if cas in mats_idx and mats_idx[cas].get("hazard_class"):
         return mats_idx[cas]["hazard_class"]
     if cas in BUILTIN_CHEM and BUILTIN_CHEM[cas][1]:
@@ -171,7 +238,6 @@ def classify_hazard(cas: str, mats_idx: dict) -> str | None:
     return None
 
 def get_density(cas: str, mats_idx: dict) -> float | None:
-    """Materials.density_g_per_ml 우선, 없으면 내장 매핑"""
     if cas in mats_idx and mats_idx[cas].get("density_g_per_ml"):
         try:
             return float(mats_idx[cas]["density_g_per_ml"])
@@ -182,7 +248,6 @@ def get_density(cas: str, mats_idx: dict) -> float | None:
     return None
 
 def to_liters(amount, unit: str, density_g_per_ml: float | None) -> float | None:
-    """단위를 L로 변환. g/kg은 밀도 필요, mL는 1000으로 나눔, L은 그대로."""
     if amount is None or unit is None:
         return None
     unit = unit.strip()
@@ -204,10 +269,9 @@ def to_liters(amount, unit: str, density_g_per_ml: float | None) -> float | None
             g = val * 1000.0
             return (g / density_g_per_ml) / 1000.0
         return None
-    # EA, cyl 등은 부피 환산 불가 → None
-    return None
+    return None  # EA, cyl 등은 환산 불가
 
-# 포맷터: 정수/퍼센트 문자열
+# 포맷터
 def fmt_int(x) -> str:
     try:
         return f"{int(round(float(x)))}"
@@ -260,9 +324,14 @@ with tab1:
     if bld.endswith("직접 입력"):
         bld = colC.text_input("건물(직접 입력)", value=st.session_state.last["bld"])
 
+    st.markdown("### ⏱ 거래 일시 (수정 가능)")
+    # 기본: 지금(UTC 기준 → Airtable은 ISO8601 저장 권장)
+    now_local = datetime.now().astimezone()
+    tx_time_input = st.datetime_input("거래일시", value=now_local)
+
     st.markdown("### 📦 수량")
     colQ1, colQ2 = st.columns([1,1])
-    qty = colQ1.number_input("수량", min_value=0.0, step=1.0, format="%.0f")  # 정수 입력 표시
+    qty = colQ1.number_input("수량", min_value=0.0, step=1.0, format="%.0f")  # 정수 입력
     unit = colQ2.selectbox("단위", ["g","mL","L","kg","EA","cyl"],
                            index=["g","mL","L","kg","EA","cyl"].index(st.session_state.last["unit"]))
 
@@ -290,6 +359,10 @@ with tab1:
         cas_no = extract_cas(text) if text else ""
         st.code(f"🔎 CAS: {cas_no or '(없음)'}")
 
+        # CAS → 물질명 자동 채움(가능 시 Materials에 반영)
+        mats_idx = load_materials_index()
+        set_material_name_if_missing(cas_no, mats_idx, name_hint=text)
+
         ready = bool(text and dept and lab and bld and room and io_type and (qty>=0))
         if not ready:
             st.info("ℹ OCR/메타/수량을 채우면 저장할 수 있어요.")
@@ -297,6 +370,9 @@ with tab1:
         if st.button("💾 Airtable에 저장", disabled=not ready):
             sign = +1 if io_type=="입고" else -1  # 출고/반품/폐기 → 음수
             img_url = upload_to_imgbb(img_bytes, uploaded_file.name)
+            # ISO8601 문자열(UTC로 변환 저장 권장)
+            tx_dt_utc = tx_time_input.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+
             fields = {
                 "Name": uploaded_file.name,
                 "ocr_text": text,
@@ -307,7 +383,8 @@ with tab1:
                 "room": room,
                 "io_type": io_type,
                 "qty": sign * qty,
-                "unit": unit
+                "unit": unit,
+                "tx_time": tx_dt_utc,   # ← 거래일시 저장(테이블에 동일 이름 Date/Time 필드 권장)
             }
             if img_url:
                 fields["Attachments"] = [{"url": img_url, "filename": uploaded_file.name}]
@@ -347,7 +424,6 @@ with tab2:
     # ---------- CAS별 ----------
     with subt1:
         st.caption("CAS별 재고합계만 표시 (지정수량/비율 제거).")
-        # (CAS, unit)별 합계
         sums = {}
         for r in tx:
             f = r.get("fields",{})
@@ -365,17 +441,16 @@ with tab2:
             rows.append({
                 "CAS": cas,
                 "물질명": m.get("name",""),
-                "재고합계": fmt_int(qty_sum),
+                "재고합계": f"{int(round(qty_sum))}",
                 "단위": unit,
                 "메모": ""
             })
 
-        # 수량 많은 순 정렬
         rows.sort(key=lambda r: int(r["재고합계"]) if r["재고합계"] else 0, reverse=True)
 
         if rows:
             df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
+            show_df(df)
             st.download_button("📥 CSV로 내려받기 (CAS별)",
                                df.to_csv(index=False).encode("utf-8-sig"),
                                file_name="inventory_by_cas.csv", mime="text/csv")
@@ -385,9 +460,8 @@ with tab2:
     # ---------- 실험실별 ----------
     with subt2:
         st.caption("실험실별 재고를 **L 단위로 환산**(가능한 항목)하여 요약과 상세를 제공합니다.")
-        # 요약: (building, room, lab)별 총 L
-        sum_lab = {}      # key: (bld, room, lab) -> liters
-        detail = []       # 상세: per CAS per lab with L/원단위
+        sum_lab = {}
+        detail = []
         skipped = []
 
         for r in tx:
@@ -410,18 +484,16 @@ with tab2:
             key = (bld, room, lab)
             sum_lab[key] = sum_lab.get(key, 0.0) + float(Lval)
 
-            # 상세표 (CAS 단위)
             m = mats_idx.get(cas, {})
             detail.append({
                 "건물": bld, "호수": room, "실험실": lab,
                 "CAS": cas, "물질명": m.get("name",""),
-                "환산보유량(L)": fmt_int(Lval),
-                "원수량": fmt_int(q), "원단위": unit
+                "환산보유량(L)": f"{int(round(Lval))}",
+                "원수량": f"{int(round(float(q)))}", "원단위": unit
             })
 
-        # 요약표
         rows_sum = [
-            {"건물": k[0], "호수": k[1], "실험실": k[2], "총보유량(L)": fmt_int(v)}
+            {"건물": k[0], "호수": k[1], "실험실": k[2], "총보유량(L)": f"{int(round(v))}"}
             for k,v in sum_lab.items()
         ]
         rows_sum.sort(key=lambda r: int(r["총보유량(L)"]) if r["총보유량(L)"] else 0, reverse=True)
@@ -429,7 +501,7 @@ with tab2:
         st.markdown("#### 🧾 실험실별 요약 (L)")
         if rows_sum:
             df_sum = pd.DataFrame(rows_sum)
-            st.dataframe(df_sum, use_container_width=True)
+            show_df(df_sum)
             st.download_button("📥 CSV로 내려받기 (실험실 요약)",
                                df_sum.to_csv(index=False).encode("utf-8-sig"),
                                file_name="inventory_by_lab_summary.csv", mime="text/csv")
@@ -439,10 +511,9 @@ with tab2:
         st.markdown("#### 🔎 실험실별 상세 (CAS)")
         if detail:
             df_det = pd.DataFrame(detail)
-            # 정렬: 건물/호수/실험실/환산량 내림차순
             df_det["__sort__"] = df_det["환산보유량(L)"].apply(lambda x: int(x) if str(x).isdigit() else 0)
             df_det = df_det.sort_values(by=["건물","호수","실험실","__sort__"], ascending=[True, True, True, False]).drop(columns="__sort__")
-            st.dataframe(df_det, use_container_width=True)
+            show_df(df_det)
             st.download_button("📥 CSV로 내려받기 (실험실 상세)",
                                df_det.to_csv(index=False).encode("utf-8-sig"),
                                file_name="inventory_by_lab_detail.csv", mime="text/csv")
@@ -451,7 +522,7 @@ with tab2:
 
         if skipped:
             with st.expander("⚠️ 환산 불가 항목 보기 (밀도/단위 문제)"):
-                st.dataframe(pd.DataFrame(skipped), use_container_width=True)
+                show_df(pd.DataFrame(skipped))
 
 # =========================
 # TAB3: 위험물(제4류) 현황 — 창고 전체 모니터링 (정수/퍼센트 + 잔여허용량)
@@ -473,9 +544,9 @@ with tab3:
         st.stop()
 
     # CAS별 부피(L) 합계 + 유별 분류
-    by_class = {}  # {haz_class: liters(float)}
+    by_class = {}
     unknown  = 0.0
-    skipped  = []  # 환산 불가 목록
+    skipped  = []
 
     for r in tx:
         f = r.get("fields",{})
@@ -485,22 +556,20 @@ with tab3:
         if not cas or q is None or not unit:
             continue
 
-        dens = get_density(cas, mats_idx)  # 우선 Materials, 없으면 내장
+        dens = get_density(cas, mats_idx)
         Lval = to_liters(q, unit, dens)
         if Lval is None:
             skipped.append({"CAS": cas, "qty": q, "unit": unit})
             continue
 
-        hclass = classify_hazard(cas, mats_idx)  # 우선 Materials, 없으면 내장
+        hclass = classify_hazard(cas, mats_idx)
         if not hclass:
             unknown += Lval
             continue
 
         by_class[hclass] = by_class.get(hclass, 0.0) + Lval
 
-    # 결과 테이블 (정수/퍼센트 + 잔여허용량)
-    disp_rows2 = []
-    csv_rows2  = []
+    disp_rows2, csv_rows2 = [], []
     order = ["특수인화물", "제1석유류(비수용성)", "제1석유류(수용성)", "알코올류"]
     for key in order:
         cur = by_class.get(key, 0.0)
@@ -513,9 +582,9 @@ with tab3:
 
         row = {
             "구분": key,
-            "현재보유량(L)": fmt_int(cur),
-            "지정수량(L)": fmt_int(limit),
-            "잔여허용량(L)": fmt_int(remain),
+            "현재보유량(L)": f"{int(round(cur))}",
+            "지정수량(L)": f"{int(round(limit))}",
+            "잔여허용량(L)": f"{int(round(remain))}",
             "비율": fmt_pct(ratio),
             "상태": status
         }
@@ -526,29 +595,16 @@ with tab3:
         st.caption("표시할 데이터가 없습니다.")
     else:
         df2 = pd.DataFrame(disp_rows2)
-        st.dataframe(df2, use_container_width=True)
+        show_df(df2)
         st.download_button("📥 CSV로 내려받기 (제4류 현황)",
                            pd.DataFrame(csv_rows2).to_csv(index=False).encode("utf-8-sig"),
                            file_name="hazard_class_4_summary.csv", mime="text/csv")
 
-    # 메모/부가정보
-    colL, colR = st.columns([2,1])
-    with colL:
-        st.markdown("##### ℹ️ 환산/분류 메모")
-        st.write("- g/kg → L 환산에는 물질별 **density_g_per_ml(밀도)** 값이 필요합니다. Materials에 추가하면 정확도가 올라갑니다.")
-        st.write("- **hazard_class**를 Materials에 지정하면 내장 추정보다 우선합니다.")
-        if unknown > 0:
-            st.warning(f"유별 미분류로 집계된 양이 있습니다. (분류되지 않은 총량: {fmt_int(unknown)} L)")
-    with colR:
-        if skipped:
-            st.markdown("##### ⚠️ 환산 불가 목록")
-            st.dataframe(pd.DataFrame(skipped))
-
 # =========================
-# TAB4: 🔄 입출고 로그 — 기간 필터
+# TAB4: 🔄 입출고 로그 — 기간 필터 + 삭제/날짜수정
 # =========================
 with tab4:
-    st.info("기간을 선택해서 입·출고·폐기 내역을 확인합니다. (Airtable의 createdTime 기준)")
+    st.info("기간을 선택해 입·출고·폐기 내역을 확인하고, 레코드를 삭제하거나 거래일시(tx_time)를 수정할 수 있습니다.")
 
     if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
         st.error("Airtable secrets가 필요합니다."); st.stop()
@@ -570,51 +626,98 @@ with tab4:
         st.error(f"불러오기 실패: {e}")
         tx, mats_idx = [], {}
 
-    # 기간 필터 (createdTime 사용)
-    def in_range(created_iso: str) -> bool:
+    # 표시용 리스트 + 선택용 옵션
+    options = []
+    logs = []
+
+    def pick_time(fields, created_iso):
+        # tx_time(사용자 입력)이 있으면 우선, 없으면 createdTime
+        t = fields.get("tx_time")
+        if t:
+            return t
+        return created_iso or ""
+
+    # 기간 필터
+    def in_range_iso(iso_str: str) -> bool:
+        if not iso_str:
+            return True
         try:
-            dt = datetime.fromisoformat(created_iso.replace("Z","+00:00")).date()
+            dt = datetime.fromisoformat(iso_str.replace("Z","+00:00")).date()
             return (start_d <= dt <= end_d)
         except:
             return True
 
-    logs = []
     for r in tx:
-        ct = r.get("createdTime")
-        if ct and not in_range(ct):
+        rid = r.get("id")
+        ct  = r.get("createdTime")
+        f   = r.get("fields",{})
+        when = pick_time(f, ct)
+        if not in_range_iso(when):
             continue
-        f = r.get("fields",{})
-        cas = (f.get("CAS") or "").strip()
-        m = mats_idx.get(cas, {})
-        logs.append({
-            "일시": ct.replace("T"," ").replace("Z","") if ct else "",
-            "구분": f.get("io_type",""),
-            "CAS": cas,
-            "물질명": m.get("name",""),
-            "수량": fmt_int(f.get("qty")),
-            "단위": f.get("unit",""),
-            "건물": f.get("building",""),
-            "호수": f.get("room",""),
-            "실험실": f.get("lab",""),
-        })
 
-    # 최근 순 정렬
-    def parse_dt(s):
-        try:
-            return datetime.fromisoformat(s)
-        except:
-            try:
-                return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            except:
-                return datetime.min
-    logs.sort(key=lambda x: parse_dt(x["일시"]), reverse=True)
+        cas = (f.get("CAS") or "").strip()
+        name = mats_idx.get(cas, {}).get("name","")
+        qty = f.get("qty")
+        unit= f.get("unit","")
+        io  = f.get("io_type","")
+        bld = f.get("building","")
+        room= f.get("room","")
+        lab = f.get("lab","")
+
+        label = f"{when} | {io} | {cas}({name}) | {int(round(float(qty))) if qty is not None else ''}{unit} | {bld} {room} {lab}"
+        options.append((label, rid))
+        logs.append({
+            "record_id": rid,
+            "일시": when.replace("T"," ").replace("Z",""),
+            "구분": io,
+            "CAS": cas,
+            "물질명": name,
+            "수량": f"{int(round(float(qty))) if qty is not None else ''}",
+            "단위": unit,
+            "건물": bld,
+            "호수": room,
+            "실험실": lab,
+        })
 
     st.markdown("#### 📒 입출고 내역")
     if logs:
         df_logs = pd.DataFrame(logs)
-        st.dataframe(df_logs, use_container_width=True)
-        st.download_button("📥 CSV로 내려받기 (입출고 로그)",
-                           df_logs.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="transactions_log.csv", mime="text/csv")
+        show_df(df_logs.drop(columns=["record_id"]))
     else:
         st.caption("표시할 데이터가 없습니다.")
+
+    st.markdown("#### ✏️ 레코드 수정/삭제")
+    if options:
+        labels = [o[0] for o in options]
+        ids    = [o[1] for o in options]
+        idx = st.selectbox("수정/삭제할 레코드를 선택하세요", options=range(len(labels)), format_func=lambda i: labels[i] if labels else "")
+        sel_id = ids[idx] if ids else None
+
+        colu1, colu2 = st.columns(2)
+        new_time = colu1.datetime_input("새 거래일시(tx_time)", value=datetime.now().astimezone())
+        do_update = colu1.button("🕒 일시 수정")
+        do_delete = colu2.button("🗑️ 삭제", type="secondary")
+
+        if sel_id and do_update:
+            # tx_time 필드가 없으면 Airtable에서 필드 생성 필요
+            try:
+                iso_new = new_time.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+                r = at_update_record(AIRTABLE_BASE_ID, tx_ref, sel_id, {"tx_time": iso_new})
+                if r.status_code in (200, 201):
+                    st.success("✅ 거래일시가 수정되었습니다. 상단 기간을 다시 적용하거나 새로고침하세요.")
+                else:
+                    st.error(f"❌ 수정 실패: {r.status_code} / {r.text}\n(Airtable에 'tx_time' Date/Time 필드를 생성했는지 확인)")
+            except Exception as e:
+                st.error(f"❌ 수정 중 오류: {e}")
+
+        if sel_id and do_delete:
+            try:
+                r = at_delete_record(AIRTABLE_BASE_ID, tx_ref, sel_id)
+                if r.status_code in (200, 202):
+                    st.success("✅ 레코드가 삭제되었습니다. 상단 기간을 다시 적용하거나 새로고침하세요.")
+                else:
+                    st.error(f"❌ 삭제 실패: {r.status_code} / {r.text}")
+            except Exception as e:
+                st.error(f"❌ 삭제 중 오류: {e}")
+    else:
+        st.caption("수정/삭제할 항목이 없습니다.")
