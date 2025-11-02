@@ -1,7 +1,7 @@
 import streamlit as st
 import requests, base64, re, pandas as pd
 from urllib.parse import quote
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, date, timezone, time as dtime
 
 # =========================
 # 기본 UI 설정
@@ -32,6 +32,21 @@ MATERIALS_TABLE_NAME  = st.secrets.get("MATERIALS_TABLE_NAME", "Materials")
 
 IMGBB_KEY             = st.secrets.get("IMGBB_KEY", "")
 DEFAULT_GCP_KEY       = st.secrets.get("GCP_KEY", "")
+
+# =========================
+# 호환용 datetime 입력 헬퍼 (Streamlit 구버전 대응)
+# =========================
+def datetime_input_compat(label: str, default_dt: datetime) -> datetime:
+    d = st.date_input(f"{label} (날짜)", value=default_dt.date())
+    t_default = default_dt.time().replace(microsecond=0)
+    t = st.time_input(f"{label} (시간)", value=t_default)
+    if isinstance(t, dtime):
+        combined = datetime.combine(d, t)
+        try:
+            return combined.replace(tzinfo=default_dt.tzinfo)
+        except Exception:
+            return combined
+    return default_dt
 
 # =========================
 # 유틸
@@ -117,10 +132,8 @@ def set_material_name_if_missing(cas_no: str, mats_idx: dict, name_hint: str = "
     current = mats_idx.get(cas_no, {})
     if current.get("name"):
         return
-    # PubChem 조회 시도
     name_found = None
     try:
-        # Title 또는 IUPACName 중 하나라도 얻어오기
         url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{cas_no}/property/Title,IUPACName/JSON"
         r = requests.get(url, timeout=12)
         if r.status_code == 200:
@@ -131,17 +144,13 @@ def set_material_name_if_missing(cas_no: str, mats_idx: dict, name_hint: str = "
                 name_found = p.get("Title") or p.get("IUPACName")
     except:
         pass
-    # fallback으로 OCR 첫줄 힌트 사용
     if not name_found:
         name_found = (name_hint or "").strip()
         if "\n" in name_found:
             name_found = name_found.split("\n", 1)[0]
         name_found = name_found[:100]
-
     if not name_found:
         return
-
-    # Materials upsert/update
     try:
         rec = at_find_one(AIRTABLE_BASE_ID, mref, formula=f"{{CAS}} = '{cas_no}'")
         if rec:
@@ -325,9 +334,8 @@ with tab1:
         bld = colC.text_input("건물(직접 입력)", value=st.session_state.last["bld"])
 
     st.markdown("### ⏱ 거래 일시 (수정 가능)")
-    # 기본: 지금(UTC 기준 → Airtable은 ISO8601 저장 권장)
     now_local = datetime.now().astimezone()
-    tx_time_input = st.datetime_input("거래일시", value=now_local)
+    tx_time_input = datetime_input_compat("거래일시", now_local)
 
     st.markdown("### 📦 수량")
     colQ1, colQ2 = st.columns([1,1])
@@ -370,7 +378,7 @@ with tab1:
         if st.button("💾 Airtable에 저장", disabled=not ready):
             sign = +1 if io_type=="입고" else -1  # 출고/반품/폐기 → 음수
             img_url = upload_to_imgbb(img_bytes, uploaded_file.name)
-            # ISO8601 문자열(UTC로 변환 저장 권장)
+            # ISO8601(UTC) 저장
             tx_dt_utc = tx_time_input.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
             fields = {
@@ -384,7 +392,7 @@ with tab1:
                 "io_type": io_type,
                 "qty": sign * qty,
                 "unit": unit,
-                "tx_time": tx_dt_utc,   # ← 거래일시 저장(테이블에 동일 이름 Date/Time 필드 권장)
+                "tx_time": tx_dt_utc,   # Airtable에 동일 이름 Date/Time 필드 권장
             }
             if img_url:
                 fields["Attachments"] = [{"url": img_url, "filename": uploaded_file.name}]
@@ -543,7 +551,6 @@ with tab3:
         st.error(f"불러오기 실패: {e}")
         st.stop()
 
-    # CAS별 부피(L) 합계 + 유별 분류
     by_class = {}
     unknown  = 0.0
     skipped  = []
@@ -626,18 +633,15 @@ with tab4:
         st.error(f"불러오기 실패: {e}")
         tx, mats_idx = [], {}
 
-    # 표시용 리스트 + 선택용 옵션
     options = []
     logs = []
 
     def pick_time(fields, created_iso):
-        # tx_time(사용자 입력)이 있으면 우선, 없으면 createdTime
         t = fields.get("tx_time")
         if t:
             return t
         return created_iso or ""
 
-    # 기간 필터
     def in_range_iso(iso_str: str) -> bool:
         if not iso_str:
             return True
@@ -694,12 +698,11 @@ with tab4:
         sel_id = ids[idx] if ids else None
 
         colu1, colu2 = st.columns(2)
-        new_time = colu1.datetime_input("새 거래일시(tx_time)", value=datetime.now().astimezone())
+        new_time = datetime_input_compat("새 거래일시(tx_time)", datetime.now().astimezone())
         do_update = colu1.button("🕒 일시 수정")
         do_delete = colu2.button("🗑️ 삭제", type="secondary")
 
         if sel_id and do_update:
-            # tx_time 필드가 없으면 Airtable에서 필드 생성 필요
             try:
                 iso_new = new_time.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
                 r = at_update_record(AIRTABLE_BASE_ID, tx_ref, sel_id, {"tx_time": iso_new})
