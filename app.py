@@ -1,5 +1,5 @@
 import streamlit as st
-import requests, base64, re, json, math
+import requests, base64, re
 from urllib.parse import quote
 import pandas as pd
 
@@ -75,7 +75,7 @@ def at_find_one(base_id, table_id_or_name, formula: str):
 
 def ensure_material_record(cas_no: str, name_guess: str = ""):
     """
-    Materials에 CAS가 없으면 자동 생성 (name만 대충 채워두고, 지정수량/단위는 비워둠)
+    Materials에 CAS가 없으면 자동 생성 (name만 대충 채워두고, 지정수량/단위/유별/밀도는 비워둠)
     """
     if not cas_no:
         return
@@ -90,7 +90,6 @@ def ensure_material_record(cas_no: str, name_guess: str = ""):
         url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{mref}"
         requests.post(url, json=payload, headers=at_headers(), timeout=20)
     except:
-        # 조용히 패스 (자동 보조 기능이라 필수는 아님)
         pass
 
 def run_ocr(image_bytes: bytes, gcp_key: str) -> dict:
@@ -124,9 +123,98 @@ def save_to_airtable(fields: dict):
     return ok, (r.text if not ok else "OK")
 
 # =========================
+# 제4류 지정수량(고정값)
+# =========================
+LEGAL_LIMITS_L = {
+    "특수인화물": 100.0,
+    "제1석유류(비수용성)": 600.0,
+    "제1석유류(수용성)": 1700.0,
+    "알코올류": 4100.0,
+}
+
+# 내장 간이 밀도 (g/mL) & 유별 매핑 (없으면 Materials 값을 사용)
+BUILTIN_CHEM = {
+    # CAS        name_hint,         hazard_class,         density_g_per_ml
+    "64-17-5":   ("Ethanol",        "알코올류",           0.789),
+    "67-63-0":   ("Isopropanol",    "알코올류",           0.786),
+    "67-56-1":   ("Methanol",       "알코올류",           0.792),
+    "67-64-1":   ("Acetone",        "제1석유류(수용성)",  0.791),
+    "75-05-8":   ("Acetonitrile",   "제1석유류(수용성)",  0.786),
+    "108-88-3":  ("Toluene",        "제1석유류(비수용성)",0.867),
+    "110-54-3":  ("n-Hexane",       "제1석유류(비수용성)",0.655),
+    "60-29-7":   ("Diethyl ether",  "특수인화물",         0.713),
+    # 필요시 계속 추가 가능
+}
+
+def load_materials_index():
+    """Materials를 CAS 키로 묶어 name, designated_qty, unit, hazard_class, density 제공"""
+    mref = table_ref(MATERIALS_TABLE_ID, MATERIALS_TABLE_NAME)
+    mats = at_get_all(AIRTABLE_BASE_ID, mref)
+    out = {}
+    for r in mats:
+        f = r.get("fields",{})
+        cas = (f.get("CAS") or "").strip()
+        if not cas:
+            continue
+        out[cas] = {
+            "name": f.get("name",""),
+            "designated_qty": f.get("designated_qty"),
+            "unit": (f.get("Unit") or f.get("unit") or ""),      # 대소문자 대응
+            "hazard_class": f.get("hazard_class",""),
+            "density_g_per_ml": f.get("density_g_per_ml"),
+        }
+    return out
+
+def classify_hazard(cas: str, mats_idx: dict) -> str | None:
+    """Materials.hazard_class 우선, 없으면 내장 매핑 사용"""
+    if cas in mats_idx and mats_idx[cas].get("hazard_class"):
+        return mats_idx[cas]["hazard_class"]
+    if cas in BUILTIN_CHEM and BUILTIN_CHEM[cas][1]:
+        return BUILTIN_CHEM[cas][1]
+    return None
+
+def get_density(cas: str, mats_idx: dict) -> float | None:
+    """Materials.density_g_per_ml 우선, 없으면 내장 매핑"""
+    if cas in mats_idx and mats_idx[cas].get("density_g_per_ml"):
+        try:
+            return float(mats_idx[cas]["density_g_per_ml"])
+        except:
+            pass
+    if cas in BUILTIN_CHEM and BUILTIN_CHEM[cas][2]:
+        return BUILTIN_CHEM[cas][2]
+    return None
+
+def to_liters(amount, unit: str, density_g_per_ml: float | None) -> float | None:
+    """단위를 L로 변환. g/kg은 밀도 필요, mL는 1000으로 나눔, L은 그대로."""
+    if amount is None or unit is None:
+        return None
+    unit = unit.strip()
+    try:
+        val = float(amount)
+    except:
+        return None
+
+    if unit == "L":
+        return val
+    if unit == "mL":
+        return val / 1000.0
+    if unit == "g":
+        if density_g_per_ml and density_g_per_ml > 0:
+            # g / (g/mL) = mL → L
+            return (val / density_g_per_ml) / 1000.0
+        return None
+    if unit == "kg":
+        if density_g_per_ml and density_g_per_ml > 0:
+            g = val * 1000.0
+            return (g / density_g_per_ml) / 1000.0
+        return None
+    # EA, cyl 등은 부피 환산 불가 → None
+    return None
+
+# =========================
 # 탭
 # =========================
-tab1, tab2 = st.tabs(["📷 기록 (OCR/저장)", "📊 재고/지정수량"])
+tab1, tab2, tab3 = st.tabs(["📷 기록 (OCR/저장)", "📊 재고/지정수량", "🏷️ 위험물(제4류) 현황"])
 
 # =========================
 # TAB1: 기록 (OCR/저장)
@@ -167,7 +255,12 @@ with tab1:
     if uploaded_file and gcp_key:
         with st.spinner("🔎 OCR 분석 중…"):
             img_bytes = uploaded_file.getvalue()
-            ocr_json = run_ocr(img_bytes, gcp_key)
+            url = f"https://vision.googleapis.com/v1/images:annotate?key={gcp_key}"
+            payload = {"requests": [{
+                "image": {"content": base64.b64encode(img_bytes).decode("utf-8")},
+                "features": [{"type": "TEXT_DETECTION"}]
+            }]}
+            ocr_json = requests.post(url, json=payload, timeout=40).json()
 
         text = ""
         try:
@@ -205,9 +298,7 @@ with tab1:
 
             ok, msg = save_to_airtable(fields)
             if ok:
-                # ✅ Materials 자동 생성 (없을 때만)
                 ensure_material_record(cas_no, name_guess=text.splitlines()[0] if text else "")
-
                 st.success("✅ 저장 완료!")
                 st.session_state.last = {"dept":dept,"lab":lab,"bld":bld,"room":room,"io":io_type,"unit":unit}
             else:
@@ -219,7 +310,7 @@ with tab1:
         st.caption("이미지와 Vision API Key를 입력하면 OCR을 시작합니다.")
 
 # =========================
-# TAB2: 재고/지정수량
+# TAB2: 재고/지정수량 (CAS별)
 # =========================
 with tab2:
     st.info("이 탭은 `Lab OCR Results`의 수량(qty)을 합산하고, `Materials`의 지정수량과 비교해 비율을 계산합니다.")
@@ -233,7 +324,7 @@ with tab2:
     try:
         with st.spinner("🔄 데이터 불러오는 중…"):
             tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
-            mats = at_get_all(AIRTABLE_BASE_ID, mat_ref)
+            mats_idx = load_materials_index()
     except Exception as e:
         st.error(f"불러오기 실패: {e}")
         st.stop()
@@ -250,23 +341,10 @@ with tab2:
         key = (cas, u or "")
         sums[key] = sums.get(key, 0.0) + float(q)
 
-    # 마스터(지정수량)
-    master = {}
-    for r in mats:
-        f = r.get("fields",{})
-        cas = (f.get("CAS") or "").strip()
-        if not cas:
-            continue
-        master[cas] = {
-            "name": f.get("name",""),
-            "designated_qty": f.get("designated_qty"),
-            "unit": f.get("unit","")
-        }
-
     # 표 구성
     rows = []
     for (cas, unit), qty_sum in sums.items():
-        m = master.get(cas, {})
+        m = mats_idx.get(cas, {})
         dqty  = m.get("designated_qty")
         dunit = m.get("unit")
         ratio = None
@@ -287,7 +365,7 @@ with tab2:
             "메모": note
         })
 
-    # 경고 높은 순 정렬
+    # 정렬: 비율 높은 순
     def ratio_key(r):
         return -(r["비율"] if r["비율"] is not None else -1)
     rows.sort(key=ratio_key)
@@ -296,32 +374,109 @@ with tab2:
     if not rows:
         st.caption("표시할 데이터가 없습니다. 기록 탭에서 먼저 저장해 주세요.")
     else:
-        # 행 색상 하이라이트
         def color_row(r):
             ratio = r["비율"]
             if ratio is None: return ""
-            if ratio >= 1.0: return "background-color:#fecaca"  # 빨강
-            if ratio >= 0.5: return "background-color:#fde68a"  # 노랑
-            if ratio >= 0.2: return "background-color:#dcfce7"  # 연초록
+            if ratio >= 1.0: return "background-color:#fecaca"
+            if ratio >= 0.5: return "background-color:#fde68a"
+            if ratio >= 0.2: return "background-color:#dcfce7"
             return ""
-
         df = pd.DataFrame(rows)
         st.dataframe(df.style.apply(lambda s: [color_row(r) for r in df.to_dict("records")], axis=0),
                      use_container_width=True)
+        st.download_button("📥 CSV로 내려받기",
+                           df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="inventory_vs_designated.csv", mime="text/csv")
 
-        # ✅ CSV 다운로드
-        st.download_button(
-            "📥 CSV로 내려받기",
-            df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="inventory_vs_designated.csv",
-            mime="text/csv"
-        )
+# =========================
+# TAB3: 위험물(제4류) 현황 — 창고 전체 모니터링
+# =========================
+with tab3:
+    st.info("제4류 위험물 기준으로, 창고 전체 저장량(L)을 유별별로 합산해 지정수량과 비교합니다. (g/kg→L 환산은 밀도 필요)")
 
-        over = [r for r in rows if (r["비율"] is not None and r["비율"]>=1.0)]
-        warn = [r for r in rows if (r["비율"] is not None and 0.5<=r["비율"]<1.0)]
-        low  = [r for r in rows if (r["비율"] is not None and 0.2<=r["비율"]<0.5)]
+    if not (AIRTABLE_TOKEN and AIRTABLE_BASE_ID):
+        st.error("Airtable secrets가 필요합니다."); st.stop()
 
-        st.markdown("#### 🚨 요약")
-        st.write(f"- 1.0 이상(초과) : **{len(over)}**건")
-        st.write(f"- 0.5 이상      : **{len(warn)}**건")
-        st.write(f"- 0.2 이상      : **{len(low)}**건")
+    tx_ref = table_ref(AIRTABLE_TABLE_ID, AIRTABLE_TABLE_NAME)
+
+    try:
+        with st.spinner("🔄 데이터 불러오는 중…"):
+            tx = at_get_all(AIRTABLE_BASE_ID, tx_ref)
+            mats_idx = load_materials_index()
+    except Exception as e:
+        st.error(f"불러오기 실패: {e}")
+        st.stop()
+
+    # CAS별 부피(L) 합계 + 유별 분류
+    by_class = {}  # {haz_class: liters}
+    unknown  = 0.0
+    skipped  = []  # 환산 불가 목록
+
+    for r in tx:
+        f = r.get("fields",{})
+        cas = (f.get("CAS") or "").strip()
+        qty = f.get("qty")
+        unit = f.get("unit")
+        if not cas or qty is None or not unit:
+            continue
+
+        dens = get_density(cas, mats_idx)  # 우선 Materials, 없으면 내장
+        Lval = to_liters(qty, unit, dens)
+        if Lval is None:
+            skipped.append({"CAS": cas, "qty": qty, "unit": unit, "reason": "밀도없음/환산불가"})
+            continue
+
+        hclass = classify_hazard(cas, mats_idx)  # 우선 Materials, 없으면 내장
+        if not hclass:
+            unknown += Lval
+            continue
+
+        by_class[hclass] = by_class.get(hclass, 0.0) + Lval
+
+    # 결과 테이블 구성
+    rows = []
+    for key in ["특수인화물", "제1석유류(비수용성)", "제1석유류(수용성)", "알코올류"]:
+        cur = round(by_class.get(key, 0.0), 3)
+        limit = LEGAL_LIMITS_L.get(key)
+        ratio = (cur / limit) if (limit and limit>0) else None
+        rows.append({
+            "구분": key,
+            "현재보유량(L)": cur,
+            "지정수량(L)": limit,
+            "비율": round(ratio,3) if ratio is not None else None,
+            "상태": ("초과" if ratio is not None and ratio>=1.0 else
+                    "경고" if ratio is not None and ratio>=0.5 else
+                    "주의" if ratio is not None and ratio>=0.2 else "정상")
+        })
+
+    # 표시
+    st.markdown("#### 📦 제4류 위험물 저장량 현황")
+    if not rows:
+        st.caption("표시할 데이터가 없습니다.")
+    else:
+        def color_row2(r):
+            ratio = r["비율"]
+            if ratio is None: return ""
+            if ratio >= 1.0: return "background-color:#fecaca"
+            if ratio >= 0.5: return "background-color:#fde68a"
+            if ratio >= 0.2: return "background-color:#dcfce7"
+            return ""
+        df2 = pd.DataFrame(rows)
+        st.dataframe(df2.style.apply(lambda s: [color_row2(r) for r in df2.to_dict("records")], axis=0),
+                     use_container_width=True)
+        st.download_button("📥 CSV로 내려받기 (제4류 현황)",
+                           df2.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="hazard_class_4_summary.csv", mime="text/csv")
+
+    # 메모/부가정보
+    colL, colR = st.columns([2,1])
+    with colL:
+        st.markdown("##### ℹ️ 환산/분류 메모")
+        st.write("- g/kg → L 환산에는 물질별 **density_g_per_ml(밀도)** 값이 필요합니다. Materials에 추가하면 정확도가 올라갑니다.")
+        st.write("- **hazard_class**를 Materials에 지정하면 내장 추정보다 우선합니다.")
+        if unknown > 0:
+            st.warning(f"유별 미분류로 집계된 양: 약 {round(unknown,3)} L (Materials.hazard_class 또는 내장 매핑에 없음)")
+    with colR:
+        if skipped:
+            st.markdown("##### ⚠️ 환산 불가 목록")
+            st.dataframe(pd.DataFrame(skipped))
